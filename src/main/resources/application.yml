@@ -96,6 +96,7 @@ yuapi:
   client:
     access-key: s3bni1ay8rbq6tfhwm1n2q5d7k1i05x3
     secret-key: f4q8lrg8vfjc9i29bbhrasjjqjsu99is
+#讯飞星火AI配置
 xunfei:
   client:
     appid: df7cf2dd

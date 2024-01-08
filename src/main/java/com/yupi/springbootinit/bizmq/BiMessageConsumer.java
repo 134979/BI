@@ -8,6 +8,12 @@ import com.yupi.springbootinit.manager.AiManager;
 import com.yupi.springbootinit.model.entity.Chart;
 import com.yupi.springbootinit.service.ChartService;
 import io.github.briqt.spark4j.SparkClient;
+import io.github.briqt.spark4j.constant.SparkApiVersion;
+import io.github.briqt.spark4j.exception.SparkException;
+import io.github.briqt.spark4j.model.SparkMessage;
+import io.github.briqt.spark4j.model.SparkSyncChatResponse;
+import io.github.briqt.spark4j.model.request.SparkRequest;
+import io.github.briqt.spark4j.model.response.SparkTextUsage;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -20,7 +26,11 @@ import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 @Slf4j
@@ -34,6 +44,9 @@ public class BiMessageConsumer {
 
     @Autowired
     private RedisTemplate<String, Object> redisTemplate;
+
+    @Resource
+    private SparkClient sparkClient;
 
     // 指定程序监听的消息队列和确认机制
     @SneakyThrows
@@ -81,8 +94,49 @@ public class BiMessageConsumer {
         if(Boolean.FALSE.equals(redisBool)){
             log.error("更新redis中图表为running失败！"+chart.getId());
         }
-        // 调用 AI
+        //构造调用讯飞AI请求
+//        SparkRequest sparkRequest=SparkRequest.builder()
+//// 消息列表
+//                .messages(buildXunFeiUserInput(chart))
+//// 模型回答的tokens的最大长度,非必传，默认为2048。
+//// V1.5取值为[1,4096]
+//// V2.0取值为[1,8192]
+//// V3.0取值为[1,8192]
+//                .maxTokens(2048)
+//// 核采样阈值。用于决定结果随机性,取值越高随机性越强即相同的问题得到的不同答案的可能性越高 非必传,取值为[0,1],默认为0.5
+//                .temperature(0.2)
+//// 指定请求版本，默认使用最新2.0版本
+//                .apiVersion(SparkApiVersion.V3_0)
+//                .build();
+//        String[] splits=null;
+//
+//        try {
+//            // 同步调用
+//            SparkSyncChatResponse chatResponse = sparkClient.chatSync(sparkRequest);
+//            SparkTextUsage textUsage = chatResponse.getTextUsage();
+//            String result = chatResponse.getContent();
+//            splits = result.split("【【【【【");
+//            if(splits.length<3){
+//                System.out.println(splits.length);
+//                channel.basicNack(deliveryTag, false, false);
+//                handleChartUpdateError(chart.getId(), "AI 生成错误");
+//                handleRedisChartUpdateError(redisChart);
+//                return;
+//            }
+//            System.out.println("\n回答：" + chatResponse.getContent());
+//        } catch (SparkException e) {
+//            System.out.println("发生异常了：" + e.getMessage());
+//            channel.basicNack(deliveryTag, false, false);
+//            handleChartUpdateError(chart.getId(), "AI 生成错误");
+//            handleRedisChartUpdateError(redisChart);
+//            return;
+//
+//        }
+
+        // 调用鱼聪明 AI
+
         String result = aiManager.doChat(CommonConstant.BI_MODEL_ID, buildUserInput(chart));
+        System.out.println(result);
         String[] splits = result.split("【【【【【");
         if (splits.length < 3) {
             channel.basicNack(deliveryTag, false, false);
@@ -90,7 +144,10 @@ public class BiMessageConsumer {
             handleRedisChartUpdateError(redisChart);
             return;
         }
-        String genChart = splits[1].trim();
+        String json=splits[1].trim();
+        String genChart=json.substring(json.indexOf('{'), json.lastIndexOf('}') + 1);
+        System.out.println(genChart);
+//        String genChart=splits[1].trim();
         String genResult = splits[2].trim();
         Chart updateChartResult = new Chart();
         updateChartResult.setId(chart.getId());
@@ -143,6 +200,45 @@ public class BiMessageConsumer {
         userInput.append("原始数据：").append("\n");
         userInput.append(csvData).append("\n");
         return userInput.toString();
+    }
+    private List<SparkMessage> buildXunFeiUserInput(Chart chart){
+        String goal = chart.getGoal();
+        String chartType = chart.getChartType();
+        String csvData = chart.getChartData();
+        final String prompt = "你是一个数据分析师和前端开发专家，接下来我会按照以下固定格式给你提供内容：\n" +
+                "分析需求：\n" +
+                "{数据分析的需求或者目标}\n" +
+                "原始数据：\n" +
+                "{csv格式的原始数据，用,作为分隔符}\n" +
+                "请根据这两部分内容，按照以下指定格式生成内容（此外不要输出任何多余的开头、结尾、注释）\n" +
+                "【【【【【\n" +
+                "{前端 Echarts V5 的 option 配置对象Js的JSON格式的代码,合理地将数据进行可视化。此外，不要生成任何多余的东西，比如注释和】】】】】}\n" +
+                "【【【【【\n" +
+                "{明确的数据分析结论、越详细越好，不要生成多余的注释}";
+//        String question="分析网站用户增长量\n"+"日期,增长量\n" +
+//                "1号,20\n" +
+//                "2号,40\t\n" +
+//                "3号,30\n" +
+//                "4号,50\n" +
+//                "5号,100";
+        // 构造用户输入
+        StringBuilder userInput = new StringBuilder();
+        userInput.append("分析需求：").append("\n");
+
+        // 拼接分析目标
+        String userGoal = goal;
+        if (StringUtils.isNotBlank(chartType)) {
+            userGoal += "，请使用" + chartType;
+        }
+        userInput.append(userGoal).append("\n");
+        userInput.append("原始数据：").append("\n");
+        userInput.append(csvData).append("\n");
+
+        // 消息列表，可以在此列表添加历史对话记录
+        List<SparkMessage> messages=new ArrayList<>();
+        messages.add(SparkMessage.systemContent(prompt));
+        messages.add(SparkMessage.userContent(userInput.toString()));
+        return messages;
     }
 
     private void handleChartUpdateError(long chartId, String execMessage) {
