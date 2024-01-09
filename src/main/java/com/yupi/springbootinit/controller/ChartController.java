@@ -30,6 +30,8 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -423,6 +425,21 @@ public class ChartController {
         ThrowUtils.throwIf(!saveResult, ErrorCode.SYSTEM_ERROR, "图表保存失败");
 
         // todo 建议处理任务队列满了后，抛异常的情况
+        runAsync(chart, biModelId, userInput);
+
+        BiResponse biResponse = new BiResponse();
+        biResponse.setChartId(chart.getId());
+        return ResultUtils.success(biResponse);
+    }
+
+    /**
+     * 执行线程池异步调用Ai
+     * @param chart
+     * @param biModelId
+     * @param userInput
+     */
+    @Retryable(maxAttempts = 3, backoff = @Backoff(delay = 1000))
+    private void runAsync(Chart chart, long biModelId, StringBuilder userInput) {
         CompletableFuture.runAsync(() -> {
             // 先修改图表任务状态为 “执行中”。等执行成功后，修改为 “已完成”、保存执行结果；执行失败后，状态修改为 “失败”，记录任务失败信息。
             Chart updateChart = new Chart();
@@ -453,10 +470,6 @@ public class ChartController {
                 handleChartUpdateError(chart.getId(), "更新图表成功状态失败");
             }
         }, threadPoolExecutor);
-
-        BiResponse biResponse = new BiResponse();
-        biResponse.setChartId(chart.getId());
-        return ResultUtils.success(biResponse);
     }
 
     /**
