@@ -78,8 +78,150 @@ public class BiMessageConsumer {
         updateRedisChart.setChartData(chart.getChartData());
         updateRedisChart.setChartType(chart.getChartType());
         Double chartScore = redisTemplate.opsForZSet().score(chart.getUserId().toString(), updateRedisChart);
-        Chart redisChart = (Chart) redisTemplate.opsForZSet().rangeByScore(chart.getUserId().toString(), chartScore, chartScore).iterator().next();
-        redisChart.setStatus("running");
+        Chart redisChart=new Chart();
+        if(chartScore!=null){
+            redisChart = (Chart) redisTemplate.opsForZSet().rangeByScore(chart.getUserId().toString(), chartScore, chartScore).iterator().next();
+            redisChart.setStatus("running");
+        }
+
+
+        boolean b = chartService.updateById(updateChart);
+        if (!b) {
+            channel.basicNack(deliveryTag, false, false);
+            handleChartUpdateError(chart.getId(), "更新图表执行中状态失败");
+            handleRedisChartUpdateError(chart);
+            return;
+        }
+        //更改redis中图表的状态为running
+        Long l = redisTemplate.opsForZSet().removeRangeByScore(chart.getUserId().toString(), chartScore, chartScore);
+        Boolean redisBool = redisTemplate.opsForZSet().add(chart.getUserId().toString(), redisChart, Instant.now().toEpochMilli());
+        if(Boolean.FALSE.equals(redisBool)){
+            log.error("更新redis中图表为running失败！"+chart.getId());
+        }
+        //构造调用讯飞AI请求
+//        SparkRequest sparkRequest=SparkRequest.builder()
+//// 消息列表
+//                .messages(buildXunFeiUserInput(chart))
+//// 模型回答的tokens的最大长度,非必传，默认为2048。
+//// V1.5取值为[1,4096]
+//// V2.0取值为[1,8192]
+//// V3.0取值为[1,8192]
+//                .maxTokens(2048)
+//// 核采样阈值。用于决定结果随机性,取值越高随机性越强即相同的问题得到的不同答案的可能性越高 非必传,取值为[0,1],默认为0.5
+//                .temperature(0.2)
+//// 指定请求版本，默认使用最新2.0版本
+//                .apiVersion(SparkApiVersion.V3_0)
+//                .build();
+//        String[] splits=null;
+//
+//        try {
+//            // 同步调用
+//            SparkSyncChatResponse chatResponse = sparkClient.chatSync(sparkRequest);
+//            SparkTextUsage textUsage = chatResponse.getTextUsage();
+//            String result = chatResponse.getContent();
+//            splits = result.split("【【【【【");
+//            if(splits.length<3){
+//                System.out.println(splits.length);
+//                channel.basicNack(deliveryTag, false, false);
+//                handleChartUpdateError(chart.getId(), "AI 生成错误");
+//                handleRedisChartUpdateError(redisChart);
+//                return;
+//            }
+//            System.out.println("\n回答：" + chatResponse.getContent());
+//        } catch (SparkException e) {
+//            System.out.println("发生异常了：" + e.getMessage());
+//            channel.basicNack(deliveryTag, false, false);
+//            handleChartUpdateError(chart.getId(), "AI 生成错误");
+//            handleRedisChartUpdateError(redisChart);
+//            return;
+//
+//        }
+
+        // 调用鱼聪明 AI
+
+        String result = aiManager.doChat(CommonConstant.BI_MODEL_ID, buildUserInput(chart));
+        System.out.println(result);
+        String[] splits = result.split("【【【【【");
+        if (splits.length < 3) {
+            channel.basicNack(deliveryTag, false, false);
+            handleChartUpdateError(chart.getId(), "AI 生成错误");
+            handleRedisChartUpdateError(redisChart);
+            return;
+        }
+        String json=splits[1].trim();
+        String genChart=json.substring(json.indexOf('{'), json.lastIndexOf('}') + 1);
+        System.out.println(genChart);
+//        String genChart=splits[1].trim();
+        String genResult = splits[2].trim();
+        Chart updateChartResult = new Chart();
+        updateChartResult.setId(chart.getId());
+        updateChartResult.setGenChart(genChart);
+        updateChartResult.setGenResult(genResult);
+        // todo 建议定义状态为枚举值
+        updateChartResult.setStatus("succeed");
+        boolean updateResult = chartService.updateById(updateChartResult);
+        chartScore = redisTemplate.opsForZSet().score(chart.getUserId().toString(), redisChart);
+        redisChart = (Chart) redisTemplate.opsForZSet().rangeByScore(chart.getUserId().toString(), chartScore, chartScore).iterator().next();
+        //删除redis中的数据
+        redisTemplate.opsForZSet().removeRangeByScore(chart.getUserId().toString(), chartScore, chartScore);
+        redisChart.setStatus("succeed");
+        redisChart.setGenChart(genChart);
+        redisChart.setGenResult(genResult);
+        if (!updateResult) {
+            channel.basicNack(deliveryTag, false, false);
+            handleChartUpdateError(chart.getId(), "更新图表成功状态失败");
+            handleRedisChartUpdateError(redisChart);
+            return;
+        }
+        Boolean bool=redisTemplate.opsForZSet().add(chart.getUserId().toString(), redisChart, Instant.now().toEpochMilli());
+        if(Boolean.FALSE.equals(bool)){
+            log.error("更新redis中图表状态失败"+redisChart.getId());
+        }
+        // 消息确认
+        channel.basicAck(deliveryTag, false);
+    }
+
+    /**
+     * 消费死信队列中的任务
+     * @param message
+     * @param channel
+     * @param deliveryTag
+     */
+    @SneakyThrows
+    @RabbitListener(queues = {BiMqConstant.BI_TTL_QUEUE_NAME}, ackMode = "MANUAL")
+    public void receiveTTLMessage(String message, Channel channel, @Header(AmqpHeaders.DELIVERY_TAG) long deliveryTag) {
+        log.info("receiveMessage message = {}", message);
+        if (StringUtils.isBlank(message)) {
+            // 如果失败，消息拒绝
+            channel.basicNack(deliveryTag, false, false);
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "消息为空");
+        }
+        long chartId = Long.parseLong(message);
+        Chart chart = chartService.getById(chartId);
+        if (chart == null) {
+            channel.basicNack(deliveryTag, false, false);
+            throw new BusinessException(ErrorCode.NOT_FOUND_ERROR, "图表为空");
+        }
+        // 先修改图表任务状态为 “执行中”。等执行成功后，修改为 “已完成”、保存执行结果；执行失败后，状态修改为 “失败”，记录任务失败信息。
+        Chart updateChart = new Chart();
+        updateChart.setId(chart.getId());
+        updateChart.setStatus("running");
+        //修改redis中图表任务状态为“执行中”。
+        Chart updateRedisChart=new Chart();
+        updateRedisChart.setId(chart.getId());
+        updateRedisChart.setUserId(chart.getUserId());
+        updateRedisChart.setGoal(chart.getGoal());
+        updateRedisChart.setStatus(chart.getStatus());
+        updateRedisChart.setName(chart.getName());
+        updateRedisChart.setChartData(chart.getChartData());
+        updateRedisChart.setChartType(chart.getChartType());
+        Double chartScore = redisTemplate.opsForZSet().score(chart.getUserId().toString(), updateRedisChart);
+        Chart redisChart=new Chart();
+        if(chartScore!=null){
+            redisChart = (Chart) redisTemplate.opsForZSet().rangeByScore(chart.getUserId().toString(), chartScore, chartScore).iterator().next();
+            redisChart.setStatus("running");
+        }
+
 
         boolean b = chartService.updateById(updateChart);
         if (!b) {
@@ -240,6 +382,9 @@ public class BiMessageConsumer {
         messages.add(SparkMessage.userContent(userInput.toString()));
         return messages;
     }
+
+
+
 
     private void handleChartUpdateError(long chartId, String execMessage) {
         Chart updateChartResult = new Chart();
